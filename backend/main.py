@@ -30,7 +30,7 @@ app.add_middleware(
 )
 
 # --- Configuration ---
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:1234/v1")
 LLM_MODEL = os.getenv("LLM_MODEL", "llama3")
 API_KEY = "dummy" # Local LLMs usually don't need a real key
 
