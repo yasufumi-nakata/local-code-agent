@@ -173,27 +173,91 @@ const extractToolCall = (text) => {
   const codeMatch =
     text.match(/```json\s*([\s\S]*?)```/i) || text.match(/```([\s\S]*?)```/);
   const candidate = codeMatch ? codeMatch[1] : text;
-  const jsonText = findFirstJsonObject(candidate) ?? (candidate !== text ? findFirstJsonObject(text) : null);
-  if (!jsonText) {
-    return null;
+  const jsonText =
+    findFirstJsonObject(candidate) ??
+    (candidate !== text ? findFirstJsonObject(text) : null);
+
+  const parseToolCallJson = (source, toolHint) => {
+    if (!source) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(source);
+      if (!parsed || typeof parsed !== "object") {
+        return null;
+      }
+
+      const namedTool =
+        typeof parsed.tool === "string"
+          ? parsed.tool
+          : typeof parsed.name === "string"
+            ? parsed.name
+            : null;
+      if (namedTool) {
+        const toolName = namedTool.trim();
+        if (!TOOL_NAMES.has(toolName)) {
+          return null;
+        }
+        let params =
+          parsed.params ?? parsed.arguments ?? parsed.args ?? {};
+        if (typeof params === "string") {
+          try {
+            params = JSON.parse(params);
+          } catch {
+            params = {};
+          }
+        }
+        if (!params || typeof params !== "object") {
+          params = {};
+        }
+        return { tool: toolName, params };
+      }
+
+      if (toolHint && TOOL_NAMES.has(toolHint)) {
+        let params = parsed;
+        if (
+          parsed.arguments !== undefined &&
+          Object.keys(parsed).length === 1
+        ) {
+          params = parsed.arguments;
+        }
+        if (typeof params === "string") {
+          try {
+            params = JSON.parse(params);
+          } catch {
+            params = {};
+          }
+        }
+        if (!params || typeof params !== "object") {
+          params = {};
+        }
+        return { tool: toolHint, params };
+      }
+
+      return null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const toolTagMatch = text.match(/to=([a-zA-Z_][\w-]*)/);
+  const toolHint = toolTagMatch?.[1]?.trim() ?? null;
+
+  const directCall = parseToolCallJson(jsonText, toolHint);
+  if (directCall) {
+    return directCall;
   }
 
-  try {
-    const parsed = JSON.parse(jsonText);
-    if (!parsed || typeof parsed.tool !== "string") {
-      return null;
+  if (toolTagMatch && toolHint) {
+    const afterTag = text.slice(toolTagMatch.index + toolTagMatch[0].length);
+    const tagJson = findFirstJsonObject(afterTag);
+    const taggedCall = parseToolCallJson(tagJson, toolHint);
+    if (taggedCall) {
+      return taggedCall;
     }
-    const toolName = parsed.tool.trim();
-    if (!TOOL_NAMES.has(toolName)) {
-      return null;
-    }
-    return {
-      tool: toolName,
-      params: parsed.params ?? {},
-    };
-  } catch (error) {
-    return null;
   }
+
+  return null;
 };
 
 const getRunCommandRisk = (command = "") => {
@@ -305,6 +369,7 @@ function App() {
   const [editorDirty, setEditorDirty] = useState(false);
   const [chatInput, setChatInput] = useState("");
   const [chatSending, setChatSending] = useState(false);
+  const [browserWorking, setBrowserWorking] = useState(false);
   const [explorerRoot, setExplorerRoot] = useState(".");
   const [explorerFilter, setExplorerFilter] = useState("");
   const [explorerEntries, setExplorerEntries] = useState([]);
@@ -344,6 +409,24 @@ function App() {
 
   useEffect(() => {
     handleExplorerRefresh();
+  }, []);
+
+  useEffect(() => {
+    const handler = (event) => {
+      if (
+        event.key === "Enter" &&
+        (event.metaKey || event.ctrlKey) &&
+        !event.isComposing
+      ) {
+        event.preventDefault();
+      }
+    };
+    window.addEventListener("keydown", handler, true);
+    window.addEventListener("keyup", handler, true);
+    return () => {
+      window.removeEventListener("keydown", handler, true);
+      window.removeEventListener("keyup", handler, true);
+    };
   }, []);
 
   const activeTask = tasks.find((task) => task.id === activeTaskId) ?? tasks[0];
@@ -475,6 +558,7 @@ function App() {
 
   const executeToolCall = async (taskId, toolCall, options = {}) => {
     const permission = getPermissionForTool(toolCall.tool);
+    const isWebSearch = toolCall.tool === "web_search";
     if (!options.skipApproval) {
       if (permission === "deny") {
         patchTask(taskId, {
@@ -500,6 +584,9 @@ function App() {
     }
 
     patchTask(taskId, { status: "running", error: "" });
+    if (isWebSearch) {
+      setBrowserWorking(true);
+    }
     try {
       const result = await executeTool(toolCall);
       const toolMessage = {
@@ -534,6 +621,10 @@ function App() {
         status: "failed",
         error: error?.message ?? "ツール実行に失敗しました",
       });
+    } finally {
+      if (isWebSearch) {
+        setBrowserWorking(false);
+      }
     }
   };
 
@@ -676,6 +767,10 @@ function App() {
 
   const executeToolForConsole = async (toolCall) => {
     setToolOutput("");
+    const isWebSearch = toolCall.tool === "web_search";
+    if (isWebSearch) {
+      setBrowserWorking(true);
+    }
     try {
       const result = await executeTool(toolCall);
       setToolOutput(result);
@@ -689,6 +784,10 @@ function App() {
       }
     } catch (error) {
       setToolOutput(error?.message ?? "ツール実行に失敗しました");
+    } finally {
+      if (isWebSearch) {
+        setBrowserWorking(false);
+      }
     }
   };
 
@@ -1004,6 +1103,38 @@ function App() {
     activeTask?.status === "running" ||
     activeTask?.status === "awaiting" ||
     chatSending;
+  const browserMessages =
+    activeTask?.messages?.filter(
+      (message) => message.role === "tool" && message.tool === "web_search",
+    ) ?? [];
+  const browserPreview = browserMessages.slice(-3);
+  const browserBusy =
+    browserWorking ||
+    activeTask?.pendingToolCall?.tool === "web_search" ||
+    chatBusy;
+  const browserStatus = browserWorking
+    ? {
+        label: "Searching",
+        tone: "text-[#f6c744]",
+        dot: "bg-[#f6c744]",
+      }
+    : activeTask?.pendingToolCall?.tool === "web_search"
+      ? {
+          label: "Queued",
+          tone: "text-[#f6c744]",
+          dot: "bg-[#f6c744]",
+        }
+      : chatBusy
+        ? {
+            label: "Thinking",
+            tone: "text-[#5eead4]",
+            dot: "bg-[#5eead4]",
+          }
+        : {
+            label: "Idle",
+            tone: "text-[var(--vscode-muted)]",
+            dot: "bg-[var(--vscode-border)]",
+          };
   const isApprovalForActiveTask =
     activeTask?.pendingToolCall &&
     pendingApprovals.some(
@@ -1238,6 +1369,50 @@ function App() {
                     </div>
                   )}
 
+                  <div className="mt-3 rounded-2xl border border-[var(--vscode-border)] bg-[var(--vscode-panel)] px-3 py-2">
+                    <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.2em] text-[var(--vscode-muted)]">
+                      <span>Browser</span>
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`flex items-center gap-2 text-[9px] uppercase tracking-[0.2em] ${browserStatus.tone}`}
+                        >
+                          <span
+                            className={`h-2 w-2 rounded-full ${browserStatus.dot} ${
+                              browserBusy ? "animate-pulse" : ""
+                            }`}
+                          />
+                          {browserStatus.label}
+                        </span>
+                        <span className="ui-chip text-[9px] text-[var(--vscode-text)]">
+                          {browserMessages.length} results
+                        </span>
+                      </div>
+                    </div>
+                    <div className="mt-2 max-h-40 space-y-2 overflow-y-auto">
+                      {browserPreview.length ? (
+                        browserPreview.map((message, index) => (
+                          <div
+                            key={`browser-${index}`}
+                            className="ui-message rounded-2xl border border-[var(--vscode-border)] bg-[rgba(15,23,42,0.35)] px-3 py-2"
+                          >
+                            <div className="text-[9px] uppercase tracking-[0.2em] text-[var(--vscode-muted)]">
+                              Browser · web_search
+                            </div>
+                            <div className="markdown-body mt-1 text-[11px] text-[var(--vscode-text)]">
+                              <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
+                                {String(message.content ?? "")}
+                              </ReactMarkdown>
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="rounded-2xl border border-dashed border-[var(--vscode-border)] px-3 py-3 text-[10px] text-[var(--vscode-muted)]">
+                          まだブラウザ結果がありません。
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
                   <div
                     ref={messageScrollRef}
                     className="ui-stagger mt-3 flex-1 space-y-2 overflow-y-auto"
@@ -1266,14 +1441,15 @@ function App() {
                               {roleLabel}
                               {message.tool ? ` · ${message.tool}` : ""}
                             </div>
-                            <ReactMarkdown
-                              remarkPlugins={[remarkGfm, remarkBreaks]}
+                            <div
                               className={`markdown-body mt-1 text-[11px] text-[var(--vscode-text)] ${
                                 message.role === "user" ? "markdown-body--user" : ""
                               }`}
                             >
-                              {String(message.content ?? "")}
-                            </ReactMarkdown>
+                              <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
+                                {String(message.content ?? "")}
+                              </ReactMarkdown>
+                            </div>
                           </div>
                         );
                       })
@@ -1300,17 +1476,9 @@ function App() {
                   )}
                   <textarea
                     ref={chatInputRef}
+                    data-chat-input="true"
                     value={chatInput}
                     onChange={(event) => setChatInput(event.target.value)}
-                    onKeyDownCapture={(event) => {
-                      if (
-                        event.key === "Enter" &&
-                        (event.ctrlKey || event.metaKey) &&
-                        !event.isComposing
-                      ) {
-                        event.preventDefault();
-                      }
-                    }}
                     onKeyDown={(event) => {
                       if (
                         event.key === "Enter" &&
