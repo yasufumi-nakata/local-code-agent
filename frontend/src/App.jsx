@@ -13,7 +13,9 @@ When you decide to use a tool, respond ONLY with a JSON object:
 {"tool":"tool_name","params":{"param1":"value1"}}
 No extra text around the JSON.
 
-When you do not need a tool, respond with a short status update and the next action.
+When a task needs multiple steps, keep iterating until completion.
+When you do not need a tool, respond ONLY with the final output. Do not include reasoning, steps, or status updates.
+When the task is complete, respond with "DONE:" followed by the final output.
 If multiple tasks are provided, handle them in order and label which task you are addressing.
 Tool results will arrive as user messages prefixed with "Tool result:".
 Ask clarifying questions only when blocked.
@@ -68,8 +70,8 @@ const DEFAULT_PERMISSION_POLICY = {
   read_file: "allow",
   list_files: "allow",
   web_search: "allow",
-  write_file: "ask",
-  run_command: "ask",
+  write_file: "allow",
+  run_command: "allow",
 };
 
 const APPROVAL_SOURCES = {
@@ -97,6 +99,9 @@ const TOOL_LABELS = {
 };
 
 const TOOL_NAMES = new Set(Object.keys(TOOL_PRESETS));
+const DONE_MARKER = /^\s*DONE:/i;
+const stripDoneMarker = (text = "") =>
+  DONE_MARKER.test(text) ? text.replace(DONE_MARKER, "").trimStart() : text;
 
 const PANEL_INPUT_BASE =
   "rounded-xl border border-[var(--vscode-border)] bg-[var(--vscode-panel)] text-[var(--vscode-text)] placeholder:text-[var(--vscode-muted)] shadow-sm transition-all focus:outline-none focus:border-[var(--vscode-accent)] focus:ring-2 focus:ring-[var(--vscode-accent)]/30 backdrop-blur";
@@ -343,9 +348,9 @@ function App() {
   );
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [sharedThread, setSharedThread] = useState(false);
-  const [autoRunTools, setAutoRunTools] = useState(false);
-  const [autoContinue, setAutoContinue] = useState(false);
-  const [maxSteps, setMaxSteps] = useState(3);
+  const [autoRunTools, setAutoRunTools] = useState(true);
+  const [autoContinue, setAutoContinue] = useState(true);
+  const [maxSteps, setMaxSteps] = useState(6);
   const [sharedMessages, setSharedMessages] = useState([]);
   const [runAllInProgress, setRunAllInProgress] = useState(false);
   const [activeView, setActiveView] = useState("workspace");
@@ -354,7 +359,8 @@ function App() {
     DEFAULT_PERMISSION_POLICY,
   );
   const [pendingApprovals, setPendingApprovals] = useState([]);
-  const [noLookMode, setNoLookMode] = useState(false);
+  const [noLookMode, setNoLookMode] = useState(true);
+  const [finalOnlyMode, setFinalOnlyMode] = useState(true);
   const [permissionNote, setPermissionNote] = useState("");
   const [toolDraft, setToolDraft] = useState({
     tool: "run_command",
@@ -544,14 +550,34 @@ function App() {
   };
 
   const handleAssistantResponse = async (taskId, assistantMessage) => {
-    const toolCall = extractToolCall(assistantMessage?.content ?? "");
+    const content = assistantMessage?.content ?? "";
+    const toolCall = extractToolCall(content);
     if (toolCall) {
       patchTask(taskId, { pendingToolCall: toolCall, status: "awaiting", error: "" });
-      const shouldAutoRun = autoRunTools || toolCall.tool === "web_search";
+      const shouldAutoRun = autoRunTools || autoContinue || toolCall.tool === "web_search";
       if (shouldAutoRun) {
         await executeToolCall(taskId, toolCall);
       }
       return;
+    }
+    if (autoContinue && !DONE_MARKER.test(content)) {
+      const task = tasksRef.current.find((entry) => entry.id === taskId);
+      const nextStep = (task?.stepCount ?? 0) + 1;
+      const stepLimit = Math.max(1, Number(maxSteps) || 1);
+      if (nextStep <= stepLimit) {
+        patchTask(taskId, { stepCount: nextStep, status: "running" });
+        const followup = [
+          "Continue the task.",
+          'If you are fully done, reply with "DONE:" and the final answer.',
+        ].join("\n");
+        const assistantReply = await sendChatRequest(
+          taskId,
+          followup,
+          getContextFiles(task),
+        );
+        await handleAssistantResponse(taskId, assistantReply);
+        return;
+      }
     }
     patchTask(taskId, { status: "done" });
   };
@@ -1135,6 +1161,21 @@ function App() {
             tone: "text-[var(--vscode-muted)]",
             dot: "bg-[var(--vscode-border)]",
           };
+  const rawMessages = activeTask?.messages ?? [];
+  const assistantMessages = rawMessages.filter(
+    (message) => message.role === "assistant",
+  );
+  const lastDoneMessage = [...assistantMessages]
+    .reverse()
+    .find((message) => DONE_MARKER.test(message.content ?? ""));
+  const lastAssistantMessage =
+    lastDoneMessage ?? [...assistantMessages].reverse()[0] ?? null;
+  const displayMessages = finalOnlyMode
+    ? [
+        ...rawMessages.filter((message) => message.role === "user"),
+        ...(lastAssistantMessage ? [lastAssistantMessage] : []),
+      ]
+    : rawMessages;
   const isApprovalForActiveTask =
     activeTask?.pendingToolCall &&
     pendingApprovals.some(
@@ -1417,9 +1458,13 @@ function App() {
                     ref={messageScrollRef}
                     className="ui-stagger mt-3 flex-1 space-y-2 overflow-y-auto"
                   >
-                    {activeTask?.messages?.length ? (
-                      activeTask.messages.map((message, index) => {
+                    {displayMessages.length ? (
+                      displayMessages.map((message, index) => {
                         const roleLabel = ROLE_LABELS[message.role] ?? message.role;
+                        const messageContent =
+                          message.role === "assistant"
+                            ? stripDoneMarker(String(message.content ?? ""))
+                            : String(message.content ?? "");
                         const messageBorder =
                           message.role === "user"
                             ? "border-[#007acc]"
@@ -1447,7 +1492,7 @@ function App() {
                               }`}
                             >
                               <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
-                                {String(message.content ?? "")}
+                                {messageContent}
                               </ReactMarkdown>
                             </div>
                           </div>
@@ -1738,6 +1783,16 @@ function App() {
                               onChange={(event) => setAutoContinue(event.target.checked)}
                             />
                             Auto-continue
+                          </label>
+                          <label className="flex items-center gap-2 text-[11px] text-[var(--vscode-muted)]">
+                            <input
+                              type="checkbox"
+                              checked={finalOnlyMode}
+                              onChange={(event) =>
+                                setFinalOnlyMode(event.target.checked)
+                              }
+                            />
+                            Final output only
                           </label>
                         </div>
                         <div className="mt-2 flex items-center gap-2 text-[10px] text-[var(--vscode-muted)]">

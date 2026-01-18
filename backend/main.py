@@ -79,7 +79,9 @@ Available Tools:
 5.  `web_search`: Searches the web via DuckDuckGo Instant Answer.
     *   params: `query` (string), `max_results` (int, optional)
 
-If you do not need to use a tool, just respond with normal text.
+When a task needs multiple steps, keep iterating until completion.
+If you do not need to use a tool, respond ONLY with the final output. Do not include reasoning, steps, or status updates.
+When the task is complete, respond with "DONE:" followed by the final output.
 If you use a tool, STOP generating after the JSON block. The system will execute it and give you the result.
 Prefer `web_search` when you need fresh or external information.
 """
