@@ -13,7 +13,9 @@ When you decide to use a tool, respond ONLY with a JSON object:
 {"tool":"tool_name","params":{"param1":"value1"}}
 No extra text around the JSON.
 
-When you do not need a tool, respond with a short status update and the next action.
+When a task needs multiple steps, keep iterating until completion.
+When you do not need a tool, respond ONLY with the final output. Do not include reasoning, steps, or status updates.
+When the task is complete, respond with "DONE:" followed by the final output.
 If multiple tasks are provided, handle them in order and label which task you are addressing.
 Tool results will arrive as user messages prefixed with "Tool result:".
 Ask clarifying questions only when blocked.
@@ -68,8 +70,8 @@ const DEFAULT_PERMISSION_POLICY = {
   read_file: "allow",
   list_files: "allow",
   web_search: "allow",
-  write_file: "ask",
-  run_command: "ask",
+  write_file: "allow",
+  run_command: "allow",
 };
 
 const APPROVAL_SOURCES = {
@@ -97,6 +99,9 @@ const TOOL_LABELS = {
 };
 
 const TOOL_NAMES = new Set(Object.keys(TOOL_PRESETS));
+const DONE_MARKER = /^\s*DONE:/i;
+const stripDoneMarker = (text = "") =>
+  DONE_MARKER.test(text) ? text.replace(DONE_MARKER, "").trimStart() : text;
 
 const PANEL_INPUT_BASE =
   "rounded-xl border border-[var(--vscode-border)] bg-[var(--vscode-panel)] text-[var(--vscode-text)] placeholder:text-[var(--vscode-muted)] shadow-sm transition-all focus:outline-none focus:border-[var(--vscode-accent)] focus:ring-2 focus:ring-[var(--vscode-accent)]/30 backdrop-blur";
@@ -173,27 +178,91 @@ const extractToolCall = (text) => {
   const codeMatch =
     text.match(/```json\s*([\s\S]*?)```/i) || text.match(/```([\s\S]*?)```/);
   const candidate = codeMatch ? codeMatch[1] : text;
-  const jsonText = findFirstJsonObject(candidate) ?? (candidate !== text ? findFirstJsonObject(text) : null);
-  if (!jsonText) {
-    return null;
+  const jsonText =
+    findFirstJsonObject(candidate) ??
+    (candidate !== text ? findFirstJsonObject(text) : null);
+
+  const parseToolCallJson = (source, toolHint) => {
+    if (!source) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(source);
+      if (!parsed || typeof parsed !== "object") {
+        return null;
+      }
+
+      const namedTool =
+        typeof parsed.tool === "string"
+          ? parsed.tool
+          : typeof parsed.name === "string"
+            ? parsed.name
+            : null;
+      if (namedTool) {
+        const toolName = namedTool.trim();
+        if (!TOOL_NAMES.has(toolName)) {
+          return null;
+        }
+        let params =
+          parsed.params ?? parsed.arguments ?? parsed.args ?? {};
+        if (typeof params === "string") {
+          try {
+            params = JSON.parse(params);
+          } catch {
+            params = {};
+          }
+        }
+        if (!params || typeof params !== "object") {
+          params = {};
+        }
+        return { tool: toolName, params };
+      }
+
+      if (toolHint && TOOL_NAMES.has(toolHint)) {
+        let params = parsed;
+        if (
+          parsed.arguments !== undefined &&
+          Object.keys(parsed).length === 1
+        ) {
+          params = parsed.arguments;
+        }
+        if (typeof params === "string") {
+          try {
+            params = JSON.parse(params);
+          } catch {
+            params = {};
+          }
+        }
+        if (!params || typeof params !== "object") {
+          params = {};
+        }
+        return { tool: toolHint, params };
+      }
+
+      return null;
+    } catch (error) {
+      return null;
+    }
+  };
+
+  const toolTagMatch = text.match(/to=([a-zA-Z_][\w-]*)/);
+  const toolHint = toolTagMatch?.[1]?.trim() ?? null;
+
+  const directCall = parseToolCallJson(jsonText, toolHint);
+  if (directCall) {
+    return directCall;
   }
 
-  try {
-    const parsed = JSON.parse(jsonText);
-    if (!parsed || typeof parsed.tool !== "string") {
-      return null;
+  if (toolTagMatch && toolHint) {
+    const afterTag = text.slice(toolTagMatch.index + toolTagMatch[0].length);
+    const tagJson = findFirstJsonObject(afterTag);
+    const taggedCall = parseToolCallJson(tagJson, toolHint);
+    if (taggedCall) {
+      return taggedCall;
     }
-    const toolName = parsed.tool.trim();
-    if (!TOOL_NAMES.has(toolName)) {
-      return null;
-    }
-    return {
-      tool: toolName,
-      params: parsed.params ?? {},
-    };
-  } catch (error) {
-    return null;
   }
+
+  return null;
 };
 
 const getRunCommandRisk = (command = "") => {
@@ -279,9 +348,9 @@ function App() {
   );
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
   const [sharedThread, setSharedThread] = useState(false);
-  const [autoRunTools, setAutoRunTools] = useState(false);
-  const [autoContinue, setAutoContinue] = useState(false);
-  const [maxSteps, setMaxSteps] = useState(3);
+  const [autoRunTools, setAutoRunTools] = useState(true);
+  const [autoContinue, setAutoContinue] = useState(true);
+  const [maxSteps, setMaxSteps] = useState(6);
   const [sharedMessages, setSharedMessages] = useState([]);
   const [runAllInProgress, setRunAllInProgress] = useState(false);
   const [activeView, setActiveView] = useState("workspace");
@@ -290,7 +359,8 @@ function App() {
     DEFAULT_PERMISSION_POLICY,
   );
   const [pendingApprovals, setPendingApprovals] = useState([]);
-  const [noLookMode, setNoLookMode] = useState(false);
+  const [noLookMode, setNoLookMode] = useState(true);
+  const [finalOnlyMode, setFinalOnlyMode] = useState(true);
   const [permissionNote, setPermissionNote] = useState("");
   const [toolDraft, setToolDraft] = useState({
     tool: "run_command",
@@ -305,6 +375,7 @@ function App() {
   const [editorDirty, setEditorDirty] = useState(false);
   const [chatInput, setChatInput] = useState("");
   const [chatSending, setChatSending] = useState(false);
+  const [browserWorking, setBrowserWorking] = useState(false);
   const [explorerRoot, setExplorerRoot] = useState(".");
   const [explorerFilter, setExplorerFilter] = useState("");
   const [explorerEntries, setExplorerEntries] = useState([]);
@@ -344,6 +415,24 @@ function App() {
 
   useEffect(() => {
     handleExplorerRefresh();
+  }, []);
+
+  useEffect(() => {
+    const handler = (event) => {
+      if (
+        event.key === "Enter" &&
+        (event.metaKey || event.ctrlKey) &&
+        !event.isComposing
+      ) {
+        event.preventDefault();
+      }
+    };
+    window.addEventListener("keydown", handler, true);
+    window.addEventListener("keyup", handler, true);
+    return () => {
+      window.removeEventListener("keydown", handler, true);
+      window.removeEventListener("keyup", handler, true);
+    };
   }, []);
 
   const activeTask = tasks.find((task) => task.id === activeTaskId) ?? tasks[0];
@@ -461,20 +550,41 @@ function App() {
   };
 
   const handleAssistantResponse = async (taskId, assistantMessage) => {
-    const toolCall = extractToolCall(assistantMessage?.content ?? "");
+    const content = assistantMessage?.content ?? "";
+    const toolCall = extractToolCall(content);
     if (toolCall) {
       patchTask(taskId, { pendingToolCall: toolCall, status: "awaiting", error: "" });
-      const shouldAutoRun = autoRunTools || toolCall.tool === "web_search";
+      const shouldAutoRun = autoRunTools || autoContinue || toolCall.tool === "web_search";
       if (shouldAutoRun) {
         await executeToolCall(taskId, toolCall);
       }
       return;
+    }
+    if (autoContinue && !DONE_MARKER.test(content)) {
+      const task = tasksRef.current.find((entry) => entry.id === taskId);
+      const nextStep = (task?.stepCount ?? 0) + 1;
+      const stepLimit = Math.max(1, Number(maxSteps) || 1);
+      if (nextStep <= stepLimit) {
+        patchTask(taskId, { stepCount: nextStep, status: "running" });
+        const followup = [
+          "Continue the task.",
+          'If you are fully done, reply with "DONE:" and the final answer.',
+        ].join("\n");
+        const assistantReply = await sendChatRequest(
+          taskId,
+          followup,
+          getContextFiles(task),
+        );
+        await handleAssistantResponse(taskId, assistantReply);
+        return;
+      }
     }
     patchTask(taskId, { status: "done" });
   };
 
   const executeToolCall = async (taskId, toolCall, options = {}) => {
     const permission = getPermissionForTool(toolCall.tool);
+    const isWebSearch = toolCall.tool === "web_search";
     if (!options.skipApproval) {
       if (permission === "deny") {
         patchTask(taskId, {
@@ -500,6 +610,9 @@ function App() {
     }
 
     patchTask(taskId, { status: "running", error: "" });
+    if (isWebSearch) {
+      setBrowserWorking(true);
+    }
     try {
       const result = await executeTool(toolCall);
       const toolMessage = {
@@ -534,6 +647,10 @@ function App() {
         status: "failed",
         error: error?.message ?? "ツール実行に失敗しました",
       });
+    } finally {
+      if (isWebSearch) {
+        setBrowserWorking(false);
+      }
     }
   };
 
@@ -676,6 +793,10 @@ function App() {
 
   const executeToolForConsole = async (toolCall) => {
     setToolOutput("");
+    const isWebSearch = toolCall.tool === "web_search";
+    if (isWebSearch) {
+      setBrowserWorking(true);
+    }
     try {
       const result = await executeTool(toolCall);
       setToolOutput(result);
@@ -689,6 +810,10 @@ function App() {
       }
     } catch (error) {
       setToolOutput(error?.message ?? "ツール実行に失敗しました");
+    } finally {
+      if (isWebSearch) {
+        setBrowserWorking(false);
+      }
     }
   };
 
@@ -1004,6 +1129,53 @@ function App() {
     activeTask?.status === "running" ||
     activeTask?.status === "awaiting" ||
     chatSending;
+  const browserMessages =
+    activeTask?.messages?.filter(
+      (message) => message.role === "tool" && message.tool === "web_search",
+    ) ?? [];
+  const browserPreview = browserMessages.slice(-3);
+  const browserBusy =
+    browserWorking ||
+    activeTask?.pendingToolCall?.tool === "web_search" ||
+    chatBusy;
+  const browserStatus = browserWorking
+    ? {
+        label: "Searching",
+        tone: "text-[#f6c744]",
+        dot: "bg-[#f6c744]",
+      }
+    : activeTask?.pendingToolCall?.tool === "web_search"
+      ? {
+          label: "Queued",
+          tone: "text-[#f6c744]",
+          dot: "bg-[#f6c744]",
+        }
+      : chatBusy
+        ? {
+            label: "Thinking",
+            tone: "text-[#5eead4]",
+            dot: "bg-[#5eead4]",
+          }
+        : {
+            label: "Idle",
+            tone: "text-[var(--vscode-muted)]",
+            dot: "bg-[var(--vscode-border)]",
+          };
+  const rawMessages = activeTask?.messages ?? [];
+  const assistantMessages = rawMessages.filter(
+    (message) => message.role === "assistant",
+  );
+  const lastDoneMessage = [...assistantMessages]
+    .reverse()
+    .find((message) => DONE_MARKER.test(message.content ?? ""));
+  const lastAssistantMessage =
+    lastDoneMessage ?? [...assistantMessages].reverse()[0] ?? null;
+  const displayMessages = finalOnlyMode
+    ? [
+        ...rawMessages.filter((message) => message.role === "user"),
+        ...(lastAssistantMessage ? [lastAssistantMessage] : []),
+      ]
+    : rawMessages;
   const isApprovalForActiveTask =
     activeTask?.pendingToolCall &&
     pendingApprovals.some(
@@ -1238,13 +1410,61 @@ function App() {
                     </div>
                   )}
 
+                  <div className="mt-3 rounded-2xl border border-[var(--vscode-border)] bg-[var(--vscode-panel)] px-3 py-2">
+                    <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.2em] text-[var(--vscode-muted)]">
+                      <span>Browser</span>
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`flex items-center gap-2 text-[9px] uppercase tracking-[0.2em] ${browserStatus.tone}`}
+                        >
+                          <span
+                            className={`h-2 w-2 rounded-full ${browserStatus.dot} ${
+                              browserBusy ? "animate-pulse" : ""
+                            }`}
+                          />
+                          {browserStatus.label}
+                        </span>
+                        <span className="ui-chip text-[9px] text-[var(--vscode-text)]">
+                          {browserMessages.length} results
+                        </span>
+                      </div>
+                    </div>
+                    <div className="mt-2 max-h-40 space-y-2 overflow-y-auto">
+                      {browserPreview.length ? (
+                        browserPreview.map((message, index) => (
+                          <div
+                            key={`browser-${index}`}
+                            className="ui-message rounded-2xl border border-[var(--vscode-border)] bg-[rgba(15,23,42,0.35)] px-3 py-2"
+                          >
+                            <div className="text-[9px] uppercase tracking-[0.2em] text-[var(--vscode-muted)]">
+                              Browser · web_search
+                            </div>
+                            <div className="markdown-body mt-1 text-[11px] text-[var(--vscode-text)]">
+                              <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
+                                {String(message.content ?? "")}
+                              </ReactMarkdown>
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="rounded-2xl border border-dashed border-[var(--vscode-border)] px-3 py-3 text-[10px] text-[var(--vscode-muted)]">
+                          まだブラウザ結果がありません。
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
                   <div
                     ref={messageScrollRef}
                     className="ui-stagger mt-3 flex-1 space-y-2 overflow-y-auto"
                   >
-                    {activeTask?.messages?.length ? (
-                      activeTask.messages.map((message, index) => {
+                    {displayMessages.length ? (
+                      displayMessages.map((message, index) => {
                         const roleLabel = ROLE_LABELS[message.role] ?? message.role;
+                        const messageContent =
+                          message.role === "assistant"
+                            ? stripDoneMarker(String(message.content ?? ""))
+                            : String(message.content ?? "");
                         const messageBorder =
                           message.role === "user"
                             ? "border-[#007acc]"
@@ -1266,14 +1486,15 @@ function App() {
                               {roleLabel}
                               {message.tool ? ` · ${message.tool}` : ""}
                             </div>
-                            <ReactMarkdown
-                              remarkPlugins={[remarkGfm, remarkBreaks]}
+                            <div
                               className={`markdown-body mt-1 text-[11px] text-[var(--vscode-text)] ${
                                 message.role === "user" ? "markdown-body--user" : ""
                               }`}
                             >
-                              {String(message.content ?? "")}
-                            </ReactMarkdown>
+                              <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]}>
+                                {messageContent}
+                              </ReactMarkdown>
+                            </div>
                           </div>
                         );
                       })
@@ -1300,17 +1521,9 @@ function App() {
                   )}
                   <textarea
                     ref={chatInputRef}
+                    data-chat-input="true"
                     value={chatInput}
                     onChange={(event) => setChatInput(event.target.value)}
-                    onKeyDownCapture={(event) => {
-                      if (
-                        event.key === "Enter" &&
-                        (event.ctrlKey || event.metaKey) &&
-                        !event.isComposing
-                      ) {
-                        event.preventDefault();
-                      }
-                    }}
                     onKeyDown={(event) => {
                       if (
                         event.key === "Enter" &&
@@ -1570,6 +1783,16 @@ function App() {
                               onChange={(event) => setAutoContinue(event.target.checked)}
                             />
                             Auto-continue
+                          </label>
+                          <label className="flex items-center gap-2 text-[11px] text-[var(--vscode-muted)]">
+                            <input
+                              type="checkbox"
+                              checked={finalOnlyMode}
+                              onChange={(event) =>
+                                setFinalOnlyMode(event.target.checked)
+                              }
+                            />
+                            Final output only
                           </label>
                         </div>
                         <div className="mt-2 flex items-center gap-2 text-[10px] text-[var(--vscode-muted)]">
