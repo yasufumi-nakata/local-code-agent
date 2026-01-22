@@ -15,6 +15,10 @@ secrets/
 private_data/
 logs/
 
+# Logs
+*.log
+*.log.*
+
 # IDE
 .vscode/
 .idea/
